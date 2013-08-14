@@ -2,18 +2,17 @@ package com.boyaa.push.lib.service;
 
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.Socket;
-import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
+import java.nio.channels.spi.SelectorProvider;
+import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.concurrent.LinkedBlockingQueue;
 
 import android.content.Context;
 import android.util.Log;
-
-import com.boyaa.push.lib.util.NetworkUtil;
 
 /**
  * 
@@ -29,32 +28,31 @@ public class NioClient {
 	private final int STATE_CONNECT_FAILED=1<<4;//连接失败
 	private final int STATE_CONNECT_WAIT=1<<5;//等待连接
 	
-	private String IP="192.168.1.100";
+	private String IP="192.168.1.101";
 	private int PORT=60000;
+
+	private Selector selector;
+	private ByteBuffer readBuffer = ByteBuffer.allocate(8192);
+	
 	
 	private int state=STATE_CONNECT_START;
 	
-	private Socket socket=null;
-	private OutputStream outStream=null;
-	private InputStream inStream=null;
-	
 	private Thread conn=null;
-	private Thread send=null;
 	private Thread rec=null;
 	
 	private Context context;
 	private ISocketResponse respListener;
-	private LinkedBlockingQueue<Packet> requestQueen=new LinkedBlockingQueue<Packet>();
+	private ArrayList<Packet> requestQueen=new ArrayList<Packet>();
 	private final Object lock=new Object();
 	private final String TAG="Client";
 	
 	public int send(Packet in)
 	{
-		requestQueen.add(in);
 		synchronized (lock) 
 		{
-			lock.notifyAll();
+			requestQueen.add(in);
 		}
+		this.selector.wakeup();
 		return in.getId();
 	}
 	
@@ -77,9 +75,9 @@ public class NioClient {
 		this.respListener=respListener;
 	}
 	
-	public boolean isNeedConn()
+	public boolean isSocketConnected()
 	{
-		return !((state==STATE_CONNECT_SUCCESS)&&(null!=send&&send.isAlive())&&(null!=rec&&rec.isAlive()));
+		return ((state==STATE_CONNECT_SUCCESS)&&(null!=rec&&rec.isAlive()));
 	}
 	
 	public void open()
@@ -115,39 +113,6 @@ public class NioClient {
 			if(state!=STATE_CLOSE)
 			{
 				try {
-					if(null!=socket)
-					{
-						socket.close();
-					}
-				} catch (Exception e) {
-					e.printStackTrace();
-				}finally{
-					socket=null;
-				}
-				
-				try {
-					if(null!=outStream)
-					{
-						outStream.close();
-					}
-				} catch (Exception e) {
-					e.printStackTrace();
-				}finally{
-					outStream=null;
-				}
-				
-				try {
-					if(null!=inStream)
-					{
-						inStream.close();
-					}
-				} catch (Exception e) {
-					e.printStackTrace();
-				}finally{
-					inStream=null;
-				}
-				
-				try {
 					if(null!=conn&&conn.isAlive())
 					{
 						conn.interrupt();
@@ -156,17 +121,6 @@ public class NioClient {
 					e.printStackTrace();
 				}finally{
 					conn=null;
-				}
-				
-				try {
-					if(null!=send&&send.isAlive())
-					{
-						send.interrupt();
-					}
-				} catch (Exception e) {
-					e.printStackTrace();
-				}finally{
-					send=null;
 				}
 				
 				try {
@@ -193,50 +147,56 @@ public class NioClient {
 		public void run() {
 Log.v(TAG,"Conn :Start");
 			try {
+					state=STATE_CONNECT_START;
+					
+					InetSocketAddress address=new InetSocketAddress(IP, PORT);
+					selector=SelectorProvider.provider().openSelector();
+					SocketChannel socketChannel = SocketChannel.open();
+					socketChannel.configureBlocking(false);
+					socketChannel.connect(address);
+					socketChannel.register(selector, SelectionKey.OP_CONNECT);
+					
 					while(state!=STATE_CLOSE)
 					{
 						try {
-							state=STATE_CONNECT_START;
-							socket=new Socket();
-							socket.connect(new InetSocketAddress(IP, PORT), 15*1000);
-							state=STATE_CONNECT_SUCCESS;
+								selector.select();
+								Iterator<SelectionKey> selectedKeys = selector.selectedKeys().iterator();
+								while (selectedKeys.hasNext())
+								{
+									SelectionKey key = (SelectionKey) selectedKeys.next();
+									selectedKeys.remove();
+
+									if (!key.isValid())
+									{
+										continue;
+									}
+
+									if (key.isConnectable()) 
+									{
+										finishConnection(key);
+									} 
+									else if (key.isReadable()) 
+									{
+										read(key);
+									} 
+									else if (key.isWritable())
+									{
+										write(key);
+									}
+								}
+								
+								synchronized(lock)
+								{
+									if(requestQueen.size()>0)
+									{
+										SelectionKey  key=socketChannel.keyFor(selector);
+										key.interestOps(SelectionKey.OP_WRITE);
+									}
+								}
+								state=STATE_CONNECT_SUCCESS;
 						} catch (Exception e) {
 							e.printStackTrace();
 							state=STATE_CONNECT_FAILED;
-						}
-						
-						if(state==STATE_CONNECT_SUCCESS)
-						{
-							try {
-								outStream=socket.getOutputStream();
-								inStream=socket.getInputStream();
-							} catch (IOException e) {
-								e.printStackTrace();
-							}
-							
-							send=new Thread(new Send());
-							rec=new Thread(new Rec());
-							send.start();
-							rec.start();
-							break;
-						}
-						else
-						{
-							state=STATE_CONNECT_WAIT;
-							//如果有网络没有连接上，则定时取连接，没有网络则直接退出
-							if(NetworkUtil.isNetworkAvailable(context))
-							{
-								try {
-										Thread.sleep(15*1000);
-								} catch (InterruptedException e) {
-									e.printStackTrace();
-									break;
-								}
-							}
-							else
-							{
-								break;
-							}
 						}
 					}
 			} catch (Exception e) {
@@ -245,90 +205,75 @@ Log.v(TAG,"Conn :Start");
 
 Log.v(TAG,"Conn :End");
 		}
-	}
-	
-	private class Send implements Runnable
-	{
-		public void run() {
-Log.v(TAG,"Send :Start");
+		
+		
+		private void finishConnection(SelectionKey key) throws IOException {
+			SocketChannel socketChannel = (SocketChannel) key.channel();
+		
+			// Finish the connection. If the connection operation failed
+			// this will raise an IOException.
 			try {
-					while(state!=STATE_CLOSE&&state==STATE_CONNECT_SUCCESS&&null!=outStream)
-					{
-								Packet item;
-								while(null!=(item=requestQueen.poll()))
-								{
-									outStream.write(item.getPacket());
-									outStream.flush();
-									item=null;
-								}
-								
-Log.v(TAG,"Send :woken up AAAAAAAAA");
-								synchronized (lock)
-								{
-									lock.wait();
-								}
-Log.v(TAG,"Send :woken up BBBBBBBBBB");
-					}
-			}catch(SocketException e1) 
-			{
-				e1.printStackTrace();//发送的时候出现异常，说明socket被关闭了(服务器关闭)java.net.SocketException: sendto failed: EPIPE (Broken pipe)
-				reconn();
-			} 
-			catch (Exception e) {
-Log.v(TAG,"Send ::Exception");
-				e.printStackTrace();
+				socketChannel.finishConnect();
+			} catch (IOException e) {
+				// Cancel the channel's registration with our selector
+Log.v("NioSocket", "finishConnection:"+e.getMessage());
+				key.cancel();
+				return;
 			}
-			
-Log.v(TAG,"Send ::End");
+		
+			// Register an interest in writing on this channel
+			key.interestOps(SelectionKey.OP_READ);
 		}
-	}
-	
-	private class Rec implements Runnable
-	{
-		public void run() {
-Log.v(TAG,"Rec :Start");
-			
+		
+		
+		private void read(SelectionKey key) throws IOException {
+			SocketChannel socketChannel = (SocketChannel) key.channel();
+
+			// Clear out our read buffer so it's ready for new data
+			readBuffer.clear();
+
+			// Attempt to read off the channel
+			int numRead;
 			try {
-					while(state!=STATE_CLOSE&&state==STATE_CONNECT_SUCCESS&&null!=inStream)
-					{
-Log.v(TAG,"Rec :---------");
-							byte[] bodyBytes=new byte[5];
-							int offset=0;
-							int length=5;
-							int read=0;
-							
-							while((read=inStream.read(bodyBytes, offset, length))>0)
-							{
-								if(length-read==0)
-								{
-									if(null!=respListener)
-									{
-										respListener.onSocketResponse(new String(bodyBytes));
-									}
-									
-									offset=0;
-									length=5;
-									read=0;
-									continue;
-								}
-								offset+=read;
-								length=5-offset;
-							}
-							
-							reconn();//走到这一步，说明服务器socket断了
-							break;
-					}
+				numRead = socketChannel.read(readBuffer);
+			} catch (IOException e) {
+				// The remote forcibly closed the connection, cancel
+				// the selection key and close the channel.
+				key.cancel();
+				socketChannel.close();
+				return;
 			}
-			catch(SocketException e1) 
-			{
-				e1.printStackTrace();//客户端主动socket.close()会调用这里 java.net.SocketException: Socket closed
-			} 
-			catch (Exception e2) {
-Log.v(TAG,"Rec :Exception");
-				e2.printStackTrace();
+
+			if (numRead == -1) {
+				// Remote entity shut the socket down cleanly. Do the
+				// same from our end and cancel the channel.
+				key.channel().close();
+				key.cancel();
+				return;
 			}
+respListener.onSocketResponse(new String(readBuffer.array(), 0, numRead));
+		}
+		
+		private void write(SelectionKey key) throws IOException 
+		{
+			SocketChannel socketChannel = (SocketChannel) key.channel();
 			
-Log.v(TAG,"Rec :End");
+			synchronized (lock) 
+			{
+				 Packet item;
+				 Iterator<Packet> iter=requestQueen.iterator();
+				 while(iter.hasNext())
+				 {
+					 item=iter.next();
+					 ByteBuffer buf=ByteBuffer.wrap(item.getPacket());
+					 socketChannel.write(buf);
+					 iter.remove();
+				 }
+				 item=null;
+			}
+
+			
+			key.interestOps(SelectionKey.OP_READ);
 		}
 	}
 }
