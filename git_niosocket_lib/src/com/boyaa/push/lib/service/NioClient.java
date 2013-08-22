@@ -11,8 +11,6 @@ import java.nio.channels.spi.SelectorProvider;
 import java.util.ArrayList;
 import java.util.Iterator;
 
-import com.boyaa.push.lib.util.LogUtil;
-
 import android.content.Context;
 import android.util.Log;
 
